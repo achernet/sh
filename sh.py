@@ -507,7 +507,10 @@ class RunningCommand(object):
                 # if we timed out, our exit code represents a signal, which is
                 # negative, so let's make it positive to store in our
                 # TimeoutException
-                raise TimeoutException(-exit_code)
+                if exit_code == 0:
+                    raise TimeoutException(self.process.call_args['timeout_signal'])
+                else:
+                    raise TimeoutException(-exit_code)
             else:
                 self.handle_command_exit_code(exit_code)
 
