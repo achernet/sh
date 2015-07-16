@@ -170,31 +170,39 @@ class ErrorReturnCode(Exception):
 
     truncate_cap = 750
 
-    def __init__(self, full_cmd, stdout, stderr):
+    def __init__(self, full_cmd, stdout, stderr, truncate=True):
         self.full_cmd = full_cmd
         self.stdout = stdout
         self.stderr = stderr
 
-
         if self.stdout is None:
             exc_stdout = "<redirected>"
         else:
-            exc_stdout = self.stdout[:self.truncate_cap]
-            out_delta = len(self.stdout) - len(exc_stdout)
-            if out_delta:
-                exc_stdout += ("... (%d more, please see e.stdout)" % out_delta).encode()
+            exc_stdout = self.stdout
+            if truncate:
+                exc_stdout = exc_stdout[:self.truncate_cap]
+                out_delta = len(self.stdout) - len(exc_stdout)
+                if out_delta:
+                    exc_stdout += ("... (%d more, please see e.stdout)" % out_delta).encode()
 
         if self.stderr is None:
             exc_stderr = "<redirected>"
         else:
-            exc_stderr = self.stderr[:self.truncate_cap]
-            err_delta = len(self.stderr) - len(exc_stderr)
-            if err_delta:
-                exc_stderr += ("... (%d more, please see e.stderr)" % err_delta).encode()
+            exc_stderr = self.stderr
+            if truncate:
+                exc_stderr = exc_stderr[:self.truncate_cap]
+                err_delta = len(self.stderr) - len(exc_stderr)
+                if err_delta:
+                    exc_stderr += ("... (%d more, please see e.stderr)" % err_delta).encode()
 
         msg = "\n\n  RAN: %r\n\n  STDOUT:\n%s\n\n  STDERR:\n%s" % \
-            (full_cmd, exc_stdout.decode(DEFAULT_ENCODING, "replace"),
+            (self.full_cmd, exc_stdout.decode(DEFAULT_ENCODING, "replace"),
              exc_stderr.decode(DEFAULT_ENCODING, "replace"))
+
+        # one final encoding.  we do this because python exceptions apparently
+        # shit the bed if they see a unicode character they don't understand
+        msg = msg.encode(DEFAULT_ENCODING, "replace")
+
         super(ErrorReturnCode, self).__init__(msg)
 
 
@@ -459,6 +467,10 @@ class RunningCommand(object):
         if call_args["err_to_out"]:
             stderr = OProc.STDOUT
 
+        done_callback = call_args["done"]
+        if done_callback:
+            call_args["done"] = partial(done_callback, self) 
+
 
         # set up which stream should write to the pipe
         # TODO, make pipe None by default and limit the size of the Queue
@@ -499,10 +511,6 @@ class RunningCommand(object):
             else:
                 self.handle_command_exit_code(exit_code)
 
-            # https://github.com/amoffat/sh/issues/185
-            if self.call_args["done"]:
-                self.call_args["done"](self)
-
         return self
 
 
@@ -510,10 +518,11 @@ class RunningCommand(object):
         """ here we determine if we had an exception, or an error code that we
         weren't expecting to see.  if we did, we create and raise an exception
         """
-        if (code not in self.call_args["ok_code"] and (code > 0 or -code in
-            SIGNALS_THAT_SHOULD_THROW_EXCEPTION)):
-            exc = get_rc_exc(code)
-            raise exc(self.ran, self.process.stdout, self.process.stderr)
+        exc_class = get_exc_exit_code_would_raise(code, self.call_args["ok_code"])
+        if exc_class:
+            exc = exc_class(self.ran, self.process.stdout, self.process.stderr,
+                    self.call_args["truncate_exc"])
+            raise exc
 
 
 
@@ -745,6 +754,9 @@ class Command(object):
         # a tuple (rows, columns) of the desired size of both the stdout and
         # stdin ttys, if ttys are being used
         "tty_size": (20, 80),
+
+        # whether or not our exceptions should be truncated
+        "truncate_exc": True,
     }
 
     # these are arguments that cannot be called together, because they wouldn't
@@ -975,9 +987,6 @@ If you're using glob.glob(), please use sh.glob() instead." % self._path, stackl
             call_args["ok_code"] = [call_args["ok_code"]]
 
 
-        if call_args["done"]:
-            call_args["bg"] = True
-
         # check if we're piping via composition
         stdin = call_args["in"]
         if args:
@@ -1108,17 +1117,31 @@ def construct_streamreader_callback(process, handler):
     return fn
 
 
+def get_exc_exit_code_would_raise(exit_code, ok_codes):
+    exc = None
+    if (exit_code not in ok_codes and (exit_code > 0 or -exit_code in
+        SIGNALS_THAT_SHOULD_THROW_EXCEPTION)):
+        exc = get_rc_exc(exit_code)
+    return exc
 
-def handle_process_exit_code(exit_code):
+
+def handle_process_exit_code(exit_code, done_callback, ok_codes):
     """ this should only ever be called once for each child process """
     # if we exited from a signal, let our exit code reflect that
     if os.WIFSIGNALED(exit_code):
-        return -os.WTERMSIG(exit_code)
+        exit_code = -os.WTERMSIG(exit_code)
     # otherwise just give us a normal exit code
     elif os.WIFEXITED(exit_code):
-        return os.WEXITSTATUS(exit_code)
+        exit_code = os.WEXITSTATUS(exit_code)
     else:
         raise RuntimeError("Unknown child exit status!")
+
+    # should we call our done callback?
+    exc = get_exc_exit_code_would_raise(exit_code, ok_codes) 
+    if done_callback:
+        done_callback(exit_code)
+
+    return exit_code
 
 
 
@@ -1575,7 +1598,8 @@ class OProc(object):
             # in order to determine how to proceed
             pid, exit_code = os.waitpid(self.pid, os.WNOHANG)
             if pid == self.pid:
-                self.exit_code = handle_process_exit_code(exit_code)
+                self.exit_code = handle_process_exit_code(exit_code,
+                        self.call_args["done"], self.call_args["ok_code"])
                 return False
 
         # no child process
@@ -1599,7 +1623,8 @@ class OProc(object):
             if self.exit_code is None:
                 self.log.debug("exit code not set, waiting on pid")
                 pid, exit_code = os.waitpid(self.pid, 0) # blocks
-                self.exit_code = handle_process_exit_code(exit_code)
+                self.exit_code = handle_process_exit_code(exit_code,
+                        self.call_args["done"], self.call_args["ok_code"])
             else:
                 self.log.debug("exit code already set (%d), no need to wait", self.exit_code)
 
@@ -2159,6 +2184,7 @@ class Environment(dict):
     # "import time" may override the time system program
     whitelist = set([
         "Command",
+        "RunningCommand",
         "CommandNotFound",
         "DEFAULT_ENCODING",
         "DoneReadingForever",

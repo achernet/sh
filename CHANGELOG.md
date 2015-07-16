@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2 -
+
+*   added `_truncate_exc`, defaulting to `True`, which tells our exceptions to truncate output.
+*   bugfix for exceptions whose messages contained unicode
+*   `_done` callback no longer assumes you want your command put in the background.
+*   `_done` callback is now called asynchronously in a separate thread.
+*   `_done` callback is called regardless of exception, which is necessary in order to release held resources, for example a process pool
+
 ## 1.10 - 12/30/14
 
 *   partially applied functions with `functools.partial` have been fixed for `_out` and `_err` callbacks [#160](https://github.com/amoffat/sh/issues/160)
