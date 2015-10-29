@@ -1,2 +1,6 @@
-__pycache__/
+**/__pycache__/
 *.py[co]
+*.iml
+**/cover/
+**/.idea/
+**/sh.egg-info/
